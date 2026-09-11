@@ -1802,6 +1802,11 @@ static RemoteRouteStatus task_follow_remote_route(
     task_status.nav_heading_locked = true;
     task_status.nav_locked_heading_deg =
         (uint16_t)(nav_locked_heading_deg + 0.5f) % 360U;
+    Motor_Stop();
+    task_status.motors_active = false;
+    nav_ready = false;
+    nav_forward_active = false;
+    task_reset_remote_targets();
   }
 
   const float desired_heading_deg = nav_heading_locked ?
@@ -1809,12 +1814,11 @@ static RemoteRouteStatus task_follow_remote_route(
   const float heading_error_deg = task_wrap_angle(
       desired_heading_deg - current_heading_deg);
   if (nav_ready &&
-      (!delivery_route &&
-       ((nav_heading_locked &&
+      ((nav_heading_locked &&
         (task_abs(heading_error_deg) >
          APP_NAV_FINAL_TURN_TOLERANCE_DEG)) ||
        (!nav_heading_locked && !reverse_route &&
-        (task_abs(heading_error_deg) >= APP_NAV_REALIGN_DEG))))) {
+        (task_abs(heading_error_deg) >= APP_NAV_REALIGN_DEG)))) {
     Motor_Stop();
     task_status.motors_active = false;
     nav_ready = false;
@@ -1829,14 +1833,6 @@ static RemoteRouteStatus task_follow_remote_route(
       /* RETURN heading is the field travel direction. Keep the body facing
        * opposite that direction and start backing up without a stationary
        * 180-degree turn. Small yaw corrections remain active while moving. */
-      nav_ready = true;
-      step_started_ms = now_ms;
-      return REMOTE_ROUTE_WAITING;
-    }
-    if (delivery_route) {
-      /* NAV bearing is a field-frame translation vector.  Do not turn in
-       * place before moving; the vector is resolved against the live body
-       * yaw below, while safe-zone yaw converges independently in the末段. */
       nav_ready = true;
       step_started_ms = now_ms;
       return REMOTE_ROUTE_WAITING;
@@ -1896,8 +1892,7 @@ static RemoteRouteStatus task_follow_remote_route(
       task_remote_route_speed(command->target_x_mm, cruise_speed_mm_s);
   const float target_speed_mm_s = reverse_route ?
       -route_speed_mm_s : route_speed_mm_s;
-  float target_yaw_mm_s = (delivery_route && !nav_heading_locked) ?
-      0.0f : task_remote_heading_correction(heading_error_deg);
+  float target_yaw_mm_s = task_remote_heading_correction(heading_error_deg);
   if (reverse_route) {
     if (target_yaw_mm_s > APP_RETURN_CENTER_HEADING_MAX_MM_S) {
       target_yaw_mm_s = APP_RETURN_CENTER_HEADING_MAX_MM_S;
@@ -1914,7 +1909,7 @@ static RemoteRouteStatus task_follow_remote_route(
   remote_yaw_mm_s = task_step_toward(
       remote_yaw_mm_s, target_yaw_mm_s,
       APP_NAV_YAW_ACCEL_MM_S2 * APP_TASK_PERIOD_MS * 0.001f);
-  if (delivery_route) {
+  if (delivery_route && nav_heading_locked) {
     task_move_field_vector(remote_speed_mm_s, command_heading_deg,
                            current_heading_deg, remote_yaw_mm_s);
   } else {
