@@ -100,8 +100,6 @@ static float reposition_distance_m;
 static uint32_t scan_entry_report_generation;
 static uint32_t nav_final_push_start_path_mm;
 static uint32_t secondary_push_start_path_mm;
-static uint32_t secondary_push_elapsed_ms;
-static uint32_t secondary_push_last_update_ms;
 static uint8_t locked_cargo_counts;
 static uint8_t configured_color;
 static bool initialized;
@@ -622,8 +620,6 @@ static void task_enter(TaskState next, uint32_t now_ms)
     start_clearance_done = false;
     secondary_push_eligible = false;
     secondary_push_lift_restore_pending = false;
-    secondary_push_elapsed_ms = 0U;
-    secondary_push_last_update_ms = now_ms;
   } else if (next == TASK_SEARCH) {
     const VisionData vision = Vision_GetSnapshot();
     camera_angle = (float)Camera_GetAngle();
@@ -652,8 +648,6 @@ static void task_enter(TaskState next, uint32_t now_ms)
     task_status.audit_valid = false;
     secondary_push_eligible = false;
     secondary_push_lift_restore_pending = false;
-    secondary_push_elapsed_ms = 0U;
-    secondary_push_last_update_ms = now_ms;
     task_reset_tracking();
     task_reset_turn_tracker();
   } else if (next == TASK_APPROACH) {
@@ -678,8 +672,6 @@ static void task_enter(TaskState next, uint32_t now_ms)
              (next == TASK_RAM_FORWARD)) {
     const LocationPose pose = Location_GetPose();
     secondary_push_start_path_mm = pose.path_mm;
-    secondary_push_elapsed_ms = 0U;
-    secondary_push_last_update_ms = now_ms;
     Lift_SetTravelPosition();
   } else if ((next == TASK_NAVIGATE) ||
              (next == TASK_ALIGN_SAFE_ZONE) ||
@@ -698,8 +690,6 @@ static void task_enter(TaskState next, uint32_t now_ms)
   } else if (next == TASK_STOPPED) {
     secondary_push_eligible = false;
     secondary_push_lift_restore_pending = false;
-    secondary_push_elapsed_ms = 0U;
-    secondary_push_last_update_ms = now_ms;
   }
 }
 
@@ -756,8 +746,6 @@ static void task_initialize(uint32_t now_ms)
   scan_entry_report_generation = 0U;
   nav_final_push_start_path_mm = 0U;
   secondary_push_start_path_mm = 0U;
-  secondary_push_elapsed_ms = 0U;
-  secondary_push_last_update_ms = now_ms;
   locked_cargo_counts = 0U;
   configured_color = 0U;
   initial_claw_ready = false;
@@ -2007,18 +1995,6 @@ static uint32_t task_secondary_path_delta_mm(const LocationPose *pose)
       (pose->path_mm - secondary_push_start_path_mm) : 0U;
 }
 
-static uint32_t task_secondary_motion_elapsed(uint32_t now_ms)
-{
-  const uint32_t delta_ms = now_ms - secondary_push_last_update_ms;
-  secondary_push_last_update_ms = now_ms;
-  if (UINT32_MAX - secondary_push_elapsed_ms < delta_ms) {
-    secondary_push_elapsed_ms = UINT32_MAX;
-  } else {
-    secondary_push_elapsed_ms += delta_ms;
-  }
-  return secondary_push_elapsed_ms;
-}
-
 static void task_set_secondary_lift(uint32_t forward_mm)
 {
   if (forward_mm > APP_DELIVERY_SECONDARY_FORWARD_DISTANCE_MM) {
@@ -2037,24 +2013,17 @@ static void task_process_secondary_back(
   if (!delivery_enter_command_ok(command, now_ms)) {
     Motor_Stop();
     task_status.motors_active = false;
-    secondary_push_last_update_ms = now_ms;
     return;
   }
 
   LocationPose pose;
   if (!task_get_location_pose(&pose, now_ms)) {
-    secondary_push_last_update_ms = now_ms;
     return;
   }
   Lift_SetTravelPosition();
   const uint32_t travelled_mm = task_secondary_path_delta_mm(&pose);
-  const uint32_t elapsed_ms = task_secondary_motion_elapsed(now_ms);
   if (travelled_mm >= APP_DELIVERY_SECONDARY_BACK_DISTANCE_MM) {
     task_enter(TASK_RAM_FORWARD, now_ms);
-    return;
-  }
-  if (elapsed_ms >= APP_DELIVERY_SECONDARY_BACK_TIMEOUT_MS) {
-    task_stop(TASK_FAULT_RAM, now_ms);
     return;
   }
   if (!Motor_MoveSpin(APP_DELIVERY_SECONDARY_BACK_SPEED_MM_S,
@@ -2071,27 +2040,20 @@ static void task_process_secondary_forward(
   if (!delivery_enter_command_ok(command, now_ms)) {
     Motor_Stop();
     task_status.motors_active = false;
-    secondary_push_last_update_ms = now_ms;
     return;
   }
 
   LocationPose pose;
   if (!task_get_location_pose(&pose, now_ms)) {
-    secondary_push_last_update_ms = now_ms;
     return;
   }
   const uint32_t forward_mm = task_secondary_path_delta_mm(&pose);
-  const uint32_t elapsed_ms = task_secondary_motion_elapsed(now_ms);
   task_set_secondary_lift(forward_mm);
   if (forward_mm >= APP_DELIVERY_SECONDARY_FORWARD_DISTANCE_MM) {
     Motor_Stop();
     task_status.motors_active = false;
     secondary_push_lift_restore_pending = true;
     task_enter(TASK_RAM_VERIFY, now_ms);
-    return;
-  }
-  if (elapsed_ms >= APP_DELIVERY_SECONDARY_FORWARD_TIMEOUT_MS) {
-    task_stop(TASK_FAULT_RAM, now_ms);
     return;
   }
   if (!Motor_MoveSpin(APP_DELIVERY_SECONDARY_FORWARD_SPEED_MM_S,
@@ -2698,8 +2660,7 @@ void Task_Process(uint32_t now_ms)
       }
     } else if ((state == TASK_RAM_BACK) ||
                (state == TASK_RAM_FORWARD)) {
-      /* A HOLD pauses the physical phase and its no-progress watchdog. */
-      secondary_push_last_update_ms = now_ms;
+      /* A HOLD pauses the physical phase; the next fresh ENTER resumes it. */
     }
     task_publish_status(now_ms);
     return;
