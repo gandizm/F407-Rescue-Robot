@@ -379,12 +379,14 @@ static bool task_validate_audit(const VisionMissionCommand *command)
       (injury && (total != 1U));
 
   if ((total == 0U) || (total > 3U) ||
-      ((uint8_t)(left_count + right_count) != total) ||
-      dangerous || unknown || injury_mixed) {
+      ((uint8_t)(left_count + right_count) != total)) {
     return false;
   }
   if (audit_initial_stash) {
     return true;
+  }
+  if (dangerous || unknown || injury_mixed) {
+    return false;
   }
   if (!first_delivery_done) {
     return (total == 1U) &&
@@ -1469,6 +1471,24 @@ static float task_remote_route_speed(int16_t remaining_mm,
   return speed_mm_s;
 }
 
+static float task_return_center_route_speed(int16_t remaining_mm,
+                                            float cruise_speed_mm_s)
+{
+  /* RDK maps its <=25 mm arrival disk to exact D=0.  Reduce positive D
+   * linearly through the configured 300 mm末段; the existing D=0 branch
+   * stops and completes RETURN. The 25 mm mapping is an upper-computer
+   * contract and still needs real-robot validation. */
+  if (remaining_mm <= (int16_t)APP_NAV_REMOTE_STOP_DISTANCE_MM) {
+    return 0.0f;
+  }
+  if (remaining_mm >= (int16_t)APP_RETURN_CENTER_SLOWDOWN_MM) {
+    return cruise_speed_mm_s;
+  }
+
+  return cruise_speed_mm_s *
+      ((float)remaining_mm / (float)APP_RETURN_CENTER_SLOWDOWN_MM);
+}
+
 static bool task_nav_payload_changed(const VisionMissionCommand *command,
                                      uint32_t now_ms)
 {
@@ -1793,8 +1813,9 @@ static RemoteRouteStatus task_follow_remote_route(
     return REMOTE_ROUTE_WAITING;
   }
 
-  const float route_speed_mm_s = task_remote_route_speed(
-      command->target_x_mm, cruise_speed_mm_s);
+  const float route_speed_mm_s = reverse_route ?
+      task_return_center_route_speed(command->target_x_mm, cruise_speed_mm_s) :
+      task_remote_route_speed(command->target_x_mm, cruise_speed_mm_s);
   const float target_speed_mm_s = reverse_route ?
       -route_speed_mm_s : route_speed_mm_s;
   float target_yaw_mm_s = task_remote_heading_correction(heading_error_deg);
@@ -2272,22 +2293,12 @@ static void task_accept_mission(const VisionMissionCommand *command,
     task_stop(TASK_FAULT_REMOTE_STOP, now_ms);
   } else if (command->command == VISION_CMD_HOLD) {
     task_status.acknowledged_sequence = command->sequence;
-    if ((state == TASK_FACE_FIELD_CENTER) && nav_payload_valid &&
-        (nav_last_distance_mm <= APP_COMPLETE_RETURN_HOLD_ACCEPT_MM)) {
-      /* The complete-flow branch currently changes to SEARCH/HOLD at its
-       * configured 0.60 m centre radius instead of transmitting RETURN D=0.
-       * Accept that hand-off only when the last genuine RETURN remainder was
-       * already within a narrow 650 mm gate; never treat a distant HOLD as
-       * arrival. */
-      task_enter(TASK_SEARCH, now_ms);
-    } else if ((state == TASK_NAVIGATE) && route_to_stash &&
-               !task_status.gripper_closed && nav_payload_valid &&
-               (distance_command_done ||
-                (nav_last_distance_mm <= APP_STASH_ROUTE_HOLD_ACCEPT_MM))) {
+    if ((state == TASK_NAVIGATE) && route_to_stash &&
+        !task_status.gripper_closed && nav_payload_valid &&
+        distance_command_done) {
       /* RETURN_STASH uses the existing NAV frame while the claws are empty.
-       * It may change back to SEARCH/HOLD on its tight map tolerance just
-       * before D reaches zero.  Accept that hand-off only after a genuine NAV
-       * payload is already within 100 mm; a distant HOLD remains a stop. */
+       * Only the current route's completed D=0 command may hand off to
+       * SEARCH.  A HOLD before distance_command_done remains a pause. */
       task_enter(TASK_SEARCH, now_ms);
     } else if ((state == TASK_REMOTE_ACTION) && remote_action.done &&
                (remote_action.type == REMOTE_ACTION_DISPERSE)) {
