@@ -44,7 +44,8 @@ typedef enum {
   REMOTE_ACTION_RELEASE_RIGHT,
   REMOTE_ACTION_RELEASE_BOTH,
   REMOTE_ACTION_DISPERSE,
-  REMOTE_ACTION_LANE
+  REMOTE_ACTION_LANE,
+  REMOTE_ACTION_DELIVERY_UNJAM
 } RemoteAction;
 
 typedef struct {
@@ -348,6 +349,8 @@ static uint8_t task_protocol_mode(void)
         case REMOTE_ACTION_RELEASE_BOTH: return 34U;
         case REMOTE_ACTION_DISPERSE:     return 35U;
         case REMOTE_ACTION_LANE:         return 36U;
+        case REMOTE_ACTION_DELIVERY_UNJAM:
+          return TASK_MODE_DELIVERY_UNJAM_DONE;
         default:                         break;
       }
     }
@@ -381,12 +384,15 @@ static bool task_validate_audit(const VisionMissionCommand *command)
       ((command->audit_flags & VISION_AUDIT_INJURY_MIXED) != 0U) ||
       (injury && (total != 1U));
 
+  if (audit_initial_stash) {
+    /* The upper computer keeps the true object count in the byte-sized total
+     * field.  Each claw count is only a saturated two-bit display value, so
+     * its sum is not a valid capacity check for the temporary stash. */
+    return total > 0U;
+  }
   if ((total == 0U) || (total > 3U) ||
       ((uint8_t)(left_count + right_count) != total)) {
     return false;
-  }
-  if (audit_initial_stash) {
-    return true;
   }
   if (dangerous || unknown || injury_mixed) {
     return false;
@@ -1606,6 +1612,20 @@ static float task_remote_heading_correction(float heading_error_deg)
   return correction;
 }
 
+static void task_move_field_vector(float speed_mm_s,
+                                   float field_heading_deg,
+                                   float current_heading_deg,
+                                   float yaw_mm_s)
+{
+  const float relative_rad = task_wrap_angle(
+      field_heading_deg - current_heading_deg) * 0.01745329252f;
+  const float forward_mm_s = speed_mm_s * cosf(relative_rad);
+  const float physical_left_mm_s = speed_mm_s * sinf(relative_rad);
+  Motor_Move(forward_mm_s,
+             physical_left_mm_s * APP_OMNI_LATERAL_API_SIGN,
+             yaw_mm_s);
+}
+
 static RemoteRouteStatus task_run_final_push(uint32_t now_ms)
 {
   LocationPose pose;
@@ -1751,8 +1771,12 @@ static RemoteRouteStatus task_follow_remote_route(
 
   const bool delivery_route =
       (expected_command == VISION_CMD_NAVIGATE_WAYPOINT) && !route_to_stash;
-  const bool terminal_timeout = delivery_route &&
-      task_nav_terminal_timeout(command->target_x_mm, now_ms);
+  if (delivery_route) {
+    /* Keep the terminal envelope as a background stale-payload guard.  It
+     * must not authorize a safe-zone push without ENTER_SAFE_ZONE, because
+     * only the upper computer has the lateral target gate. */
+    (void)task_nav_terminal_timeout(command->target_x_mm, now_ms);
+  }
 
   const float current_heading_deg = (float)pose.heading_mdeg * 0.001f;
   const float command_heading_deg = (float)command->heading_cdeg * 0.01f;
@@ -1760,9 +1784,7 @@ static RemoteRouteStatus task_follow_remote_route(
       expected_command == VISION_CMD_RETURN_CENTER;
   const float route_body_heading_deg = reverse_route ?
       task_wrap_angle(command_heading_deg + 180.0f) : command_heading_deg;
-  const bool lock_allowed =
-      (expected_command == VISION_CMD_NAVIGATE_WAYPOINT) &&
-      !route_to_stash;
+  const bool lock_allowed = delivery_route;
 
   if (nav_heading_locked &&
       (!lock_allowed ||
@@ -1780,13 +1802,6 @@ static RemoteRouteStatus task_follow_remote_route(
     task_status.nav_heading_locked = true;
     task_status.nav_locked_heading_deg =
         (uint16_t)(nav_locked_heading_deg + 0.5f) % 360U;
-    /* Stop translation and complete the configured final alignment before
-     * pushing. The first delivery applies the calibrated side offset. */
-    Motor_Stop();
-    task_status.motors_active = false;
-    nav_ready = false;
-    nav_forward_active = false;
-    task_reset_remote_targets();
   }
 
   const float desired_heading_deg = nav_heading_locked ?
@@ -1794,11 +1809,12 @@ static RemoteRouteStatus task_follow_remote_route(
   const float heading_error_deg = task_wrap_angle(
       desired_heading_deg - current_heading_deg);
   if (nav_ready &&
-      ((nav_heading_locked &&
+      (!delivery_route &&
+       ((nav_heading_locked &&
         (task_abs(heading_error_deg) >
          APP_NAV_FINAL_TURN_TOLERANCE_DEG)) ||
        (!nav_heading_locked && !reverse_route &&
-        (task_abs(heading_error_deg) >= APP_NAV_REALIGN_DEG)))) {
+        (task_abs(heading_error_deg) >= APP_NAV_REALIGN_DEG))))) {
     Motor_Stop();
     task_status.motors_active = false;
     nav_ready = false;
@@ -1817,6 +1833,14 @@ static RemoteRouteStatus task_follow_remote_route(
       step_started_ms = now_ms;
       return REMOTE_ROUTE_WAITING;
     }
+    if (delivery_route) {
+      /* NAV bearing is a field-frame translation vector.  Do not turn in
+       * place before moving; the vector is resolved against the live body
+       * yaw below, while safe-zone yaw converges independently in the末段. */
+      nav_ready = true;
+      step_started_ms = now_ms;
+      return REMOTE_ROUTE_WAITING;
+    }
     const float turn_tolerance_deg = nav_heading_locked ?
         APP_NAV_FINAL_TURN_TOLERANCE_DEG :
         APP_NAV_HEADING_TOLERANCE_DEG;
@@ -1831,12 +1855,17 @@ static RemoteRouteStatus task_follow_remote_route(
   }
 
   if (delivery_route &&
-      ((command->target_x_mm <=
-        (int16_t)APP_NAV_REMOTE_STOP_DISTANCE_MM) ||
-       nav_final_push_active || terminal_timeout)) {
-    return task_run_final_push(now_ms);
+      (command->target_x_mm <=
+       (int16_t)APP_NAV_REMOTE_STOP_DISTANCE_MM)) {
+    task_pause_final_push(now_ms);
+    Motor_Stop();
+    task_status.motors_active = false;
+    nav_forward_active = false;
+    distance_command_done = true;
+    task_status.nav_done = true;
+    task_reset_remote_targets();
+    return REMOTE_ROUTE_REACHED;
   }
-
   if (!nav_forward_active) {
     nav_forward_active = true;
     nav_payload_change_ms = now_ms;
@@ -1867,7 +1896,8 @@ static RemoteRouteStatus task_follow_remote_route(
       task_remote_route_speed(command->target_x_mm, cruise_speed_mm_s);
   const float target_speed_mm_s = reverse_route ?
       -route_speed_mm_s : route_speed_mm_s;
-  float target_yaw_mm_s = task_remote_heading_correction(heading_error_deg);
+  float target_yaw_mm_s = (delivery_route && !nav_heading_locked) ?
+      0.0f : task_remote_heading_correction(heading_error_deg);
   if (reverse_route) {
     if (target_yaw_mm_s > APP_RETURN_CENTER_HEADING_MAX_MM_S) {
       target_yaw_mm_s = APP_RETURN_CENTER_HEADING_MAX_MM_S;
@@ -1884,7 +1914,12 @@ static RemoteRouteStatus task_follow_remote_route(
   remote_yaw_mm_s = task_step_toward(
       remote_yaw_mm_s, target_yaw_mm_s,
       APP_NAV_YAW_ACCEL_MM_S2 * APP_TASK_PERIOD_MS * 0.001f);
-  Motor_Move(remote_speed_mm_s, 0.0f, remote_yaw_mm_s);
+  if (delivery_route) {
+    task_move_field_vector(remote_speed_mm_s, command_heading_deg,
+                           current_heading_deg, remote_yaw_mm_s);
+  } else {
+    Motor_Move(remote_speed_mm_s, 0.0f, remote_yaw_mm_s);
+  }
   task_status.motors_active = true;
   return REMOTE_ROUTE_RUNNING;
 }
@@ -2358,6 +2393,23 @@ static void task_process_remote_action(const VisionMissionCommand *command,
       }
       return;
 
+    case REMOTE_ACTION_DELIVERY_UNJAM:
+      if (remote_action.phase == 0U) {
+        /* The 500 ms interval is a non-blocking mechanical settle after the
+         * lift command, not a failure timeout. */
+        Lift_SetAngle(APP_LIFT_START_ANGLE);
+        if ((uint32_t)(now_ms - step_started_ms) >=
+            APP_DELIVERY_UNJAM_LIFT_SETTLE_MS) {
+          task_remote_action_advance(now_ms);
+        }
+      } else if (remote_action.phase == 1U) {
+        if (task_remote_lateral(remote_action.arg_a,
+                                APP_REMOTE_LANE_SPEED_MM_S, now_ms)) {
+          task_remote_action_finish();
+        }
+      }
+      return;
+
     case REMOTE_ACTION_DISPERSE:
       if (remote_action.phase == 0U) {
         if (Claw_Open(now_ms)) {
@@ -2556,6 +2608,15 @@ static void task_accept_mission(const VisionMissionCommand *command,
              !task_status.gripper_closed &&
              (state == TASK_RAM_VERIFY)) {
     task_status.acknowledged_sequence = command->sequence;
+  } else if ((command->command == VISION_CMD_DELIVERY_UNJAM) &&
+             complete_flow_active &&
+             !task_status.gripper_closed &&
+             (state == TASK_RAM_VERIFY)) {
+    task_status.acknowledged_sequence = command->sequence;
+    /* Keep the lift raised until the ordinary RETURN_CENTER route has really
+     * completed; this action is not a delivery success or TASK_COMPLETE. */
+    secondary_push_lift_restore_pending = true;
+    task_start_remote_action(REMOTE_ACTION_DELIVERY_UNJAM, command, now_ms);
   } else if ((command->command == VISION_CMD_RETURN_CENTER) &&
              (state == TASK_FACE_FIELD_CENTER)) {
     task_status.acknowledged_sequence = command->sequence;

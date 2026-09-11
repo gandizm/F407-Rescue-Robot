@@ -118,7 +118,9 @@ typedef enum {
   VISION_CMD_RELEASE_BOTH = 15,
   VISION_CMD_DISPERSE_PILE = 16,
   VISION_CMD_CHANGE_LANE = 17,
-  VISION_CMD_CARGO_AUDIT = 18
+  VISION_CMD_CARGO_AUDIT = 18,
+  /* Independent delivery-observation recovery; not a lane change. */
+  VISION_CMD_DELIVERY_UNJAM = 19
 } VisionMissionCode;
 
 #define VISION_AUDIT_INITIAL_STASH      0x01U

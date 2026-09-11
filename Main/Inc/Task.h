@@ -31,6 +31,9 @@ typedef enum {
   TASK_REMOTE_ACTION = 25
 } TaskState;
 
+/* TYPE=0x17 status value for a completed DELIVERY_UNJAM action. */
+#define TASK_MODE_DELIVERY_UNJAM_DONE 37U
+
 typedef enum {
   TASK_FAULT_NONE = 0,
   TASK_FAULT_REMOTE_STOP,

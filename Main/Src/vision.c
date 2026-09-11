@@ -191,7 +191,8 @@ static bool vision_mission_code_valid(uint8_t command)
 {
   return (command == VISION_CMD_STOP) ||
          ((command >= VISION_CMD_GRAB_CONFIRMED) &&
-          (command <= VISION_CMD_CARGO_AUDIT));
+          (command <= VISION_CMD_CARGO_AUDIT)) ||
+         (command == VISION_CMD_DELIVERY_UNJAM);
 }
 
 static void vision_save_mission(const uint8_t *payload, uint8_t sequence,
@@ -230,6 +231,16 @@ static void vision_save_mission(const uint8_t *payload, uint8_t sequence,
     return;
   }
   if ((code == VISION_CMD_ENTER_SAFE_ZONE) && (heading >= 36000U)) {
+    return;
+  }
+  if ((code == VISION_CMD_DELIVERY_UNJAM) &&
+      (((flags & (VISION_CMD_DRIVE_STRAIGHT |
+                  VISION_CMD_USE_FINAL_HEADING |
+                  VISION_CMD_RED_SIDE |
+                  VISION_CMD_DISTANCE_VALID)) != 0U) ||
+       ((arg_a != (int16_t)APP_DELIVERY_UNJAM_DISTANCE_MM) &&
+        (arg_a != -(int16_t)APP_DELIVERY_UNJAM_DISTANCE_MM)) ||
+       (arg_b != 0) || (heading != 0U))) {
     return;
   }
   if ((code == VISION_CMD_CARGO_AUDIT) &&
