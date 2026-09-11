@@ -19,7 +19,7 @@ typedef enum {
   /* Reserved protocol value: safe-zone heading alignment was removed. */
   TASK_ALIGN_SAFE_ZONE,
   TASK_OPEN_FOR_RAM,
-  /* Reserved protocol values: collision delivery has been removed. */
+  /* Complete-flow secondary delivery push phases. */
   TASK_RAM_BACK,
   TASK_RAM_FORWARD,
   TASK_RAM_VERIFY,

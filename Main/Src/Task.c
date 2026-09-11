@@ -99,6 +99,9 @@ static float reposition_heading_deg;
 static float reposition_distance_m;
 static uint32_t scan_entry_report_generation;
 static uint32_t nav_final_push_start_path_mm;
+static uint32_t secondary_push_start_path_mm;
+static uint32_t secondary_push_elapsed_ms;
+static uint32_t secondary_push_last_update_ms;
 static uint8_t locked_cargo_counts;
 static uint8_t configured_color;
 static bool initialized;
@@ -122,6 +125,8 @@ static bool nav_heading_locked;
 static bool nav_final_push_active;
 static bool nav_final_push_done;
 static bool nav_final_push_paused;
+static bool secondary_push_eligible;
+static bool secondary_push_lift_restore_pending;
 static bool first_delivery_done;
 static bool complete_flow_active;
 static bool audit_received;
@@ -409,6 +414,39 @@ static bool task_validate_audit(const VisionMissionCommand *command)
           (right == VISION_CARGO_MIXED_MATERIAL));
 }
 
+static bool task_secondary_push_allowed(void)
+{
+  const uint8_t left_count = audit_last_counts & 0x03U;
+  const uint8_t right_count = (audit_last_counts >> 2) & 0x03U;
+  const uint8_t total = audit_last_total_count;
+  const uint8_t disallowed_flags = VISION_AUDIT_DANGER_PRESENT |
+                                   VISION_AUDIT_UNKNOWN_PRESENT |
+                                   VISION_AUDIT_INJURY_MIXED;
+  const bool left_material =
+      (audit_last_left_class == VISION_CARGO_GREEN) ||
+      (audit_last_left_class == VISION_CARGO_CORE) ||
+      (audit_last_left_class == VISION_CARGO_MIXED_MATERIAL);
+  const bool right_material =
+      (audit_last_right_class == VISION_CARGO_GREEN) ||
+      (audit_last_right_class == VISION_CARGO_CORE) ||
+      (audit_last_right_class == VISION_CARGO_MIXED_MATERIAL);
+  const bool core_present =
+      ((left_count > 0U) &&
+       ((audit_last_left_class == VISION_CARGO_CORE) ||
+        (audit_last_left_class == VISION_CARGO_MIXED_MATERIAL))) ||
+      ((right_count > 0U) &&
+       ((audit_last_right_class == VISION_CARGO_CORE) ||
+        (audit_last_right_class == VISION_CARGO_MIXED_MATERIAL)));
+
+  return complete_flow_active && audit_received && audit_valid &&
+         !audit_initial_stash && !audit_destination_injury &&
+         ((audit_last_flags & disallowed_flags) == 0U) &&
+         (total >= 2U) && (total <= 3U) &&
+         ((uint8_t)(left_count + right_count) == total) &&
+         ((left_count == 0U) || left_material) &&
+         ((right_count == 0U) || right_material) && core_present;
+}
+
 static void task_latch_audit(const VisionMissionCommand *command)
 {
   const uint8_t semantic_flags = command->audit_flags &
@@ -582,6 +620,10 @@ static void task_enter(TaskState next, uint32_t now_ms)
     start_target_heading_deg = task_wrap_angle(
         (float)pose.heading_mdeg * 0.001f + APP_START_TURN_DEG);
     start_clearance_done = false;
+    secondary_push_eligible = false;
+    secondary_push_lift_restore_pending = false;
+    secondary_push_elapsed_ms = 0U;
+    secondary_push_last_update_ms = now_ms;
   } else if (next == TASK_SEARCH) {
     const VisionData vision = Vision_GetSnapshot();
     camera_angle = (float)Camera_GetAngle();
@@ -608,6 +650,10 @@ static void task_enter(TaskState next, uint32_t now_ms)
     task_status.audit_total_count = 0U;
     task_status.audit_ready = false;
     task_status.audit_valid = false;
+    secondary_push_eligible = false;
+    secondary_push_lift_restore_pending = false;
+    secondary_push_elapsed_ms = 0U;
+    secondary_push_last_update_ms = now_ms;
     task_reset_tracking();
     task_reset_turn_tracker();
   } else if (next == TASK_APPROACH) {
@@ -628,6 +674,13 @@ static void task_enter(TaskState next, uint32_t now_ms)
     task_reset_tracking();
   } else if (next == TASK_GRAB_ROTATE) {
     task_reset_turn_tracker();
+  } else if ((next == TASK_RAM_BACK) ||
+             (next == TASK_RAM_FORWARD)) {
+    const LocationPose pose = Location_GetPose();
+    secondary_push_start_path_mm = pose.path_mm;
+    secondary_push_elapsed_ms = 0U;
+    secondary_push_last_update_ms = now_ms;
+    Lift_SetTravelPosition();
   } else if ((next == TASK_NAVIGATE) ||
              (next == TASK_ALIGN_SAFE_ZONE) ||
              (next == TASK_FACE_FIELD_CENTER)) {
@@ -639,6 +692,14 @@ static void task_enter(TaskState next, uint32_t now_ms)
     remote_speed_mm_s = 0.0f;
     remote_yaw_mm_s = 0.0f;
     nav_payload_change_ms = now_ms;
+    if (next == TASK_FACE_FIELD_CENTER) {
+      secondary_push_eligible = false;
+    }
+  } else if (next == TASK_STOPPED) {
+    secondary_push_eligible = false;
+    secondary_push_lift_restore_pending = false;
+    secondary_push_elapsed_ms = 0U;
+    secondary_push_last_update_ms = now_ms;
   }
 }
 
@@ -694,6 +755,9 @@ static void task_initialize(uint32_t now_ms)
   reposition_distance_m = 0.0f;
   scan_entry_report_generation = 0U;
   nav_final_push_start_path_mm = 0U;
+  secondary_push_start_path_mm = 0U;
+  secondary_push_elapsed_ms = 0U;
+  secondary_push_last_update_ms = now_ms;
   locked_cargo_counts = 0U;
   configured_color = 0U;
   initial_claw_ready = false;
@@ -716,6 +780,8 @@ static void task_initialize(uint32_t now_ms)
   nav_final_push_active = false;
   nav_final_push_done = false;
   nav_final_push_paused = false;
+  secondary_push_eligible = false;
+  secondary_push_lift_restore_pending = false;
   first_delivery_done = false;
   complete_flow_active = false;
   audit_received = false;
@@ -925,37 +991,32 @@ static void task_process_start(uint32_t now_ms)
     return;
   }
 
-  const uint32_t remaining_mm = APP_START_REVERSE_DISTANCE_MM - travelled_mm;
-  const float speed_mm_s =
-      (remaining_mm <= APP_START_REVERSE_SLOW_REMAINING_MM) ?
-      APP_START_REVERSE_SLOW_SPEED_MM_S : APP_START_REVERSE_SPEED_MM_S;
-
-  /* The first 0.60 m is a true encoder-distance move with IMU heading hold.
-   * Keep every mechanism folded until that obstacle clearance is complete. */
-  if (!start_clearance_done) {
-    const MotorDistanceStatus result = Motor_MoveDistance(
-        -APP_START_CLEARANCE_DISTANCE_M,
-        APP_START_CLEARANCE_SPEED_MM_S);
-    task_status.motors_active = result == MOTOR_DISTANCE_RUNNING;
-    if (result == MOTOR_DISTANCE_DONE) {
-      start_clearance_done = true;
-      Lift_SetTravelPosition();
-      (void)Claw_Open(now_ms);
-    } else if (distance_failed(result)) {
-      task_stop(TASK_FAULT_MOTOR, now_ms);
-    }
-    return;
+  const uint32_t clearance_mm = (uint32_t)(
+      APP_START_CLEARANCE_DISTANCE_M * 1000.0f + 0.5f);
+  if (!start_clearance_done && (travelled_mm >= clearance_mm)) {
+    start_clearance_done = true;
+    Lift_SetTravelPosition();
+    (void)Claw_Open(now_ms);
   }
 
-  Lift_SetTravelPosition();
-  (void)Claw_Open(now_ms);
+  const uint32_t remaining_mm = APP_START_REVERSE_DISTANCE_MM - travelled_mm;
+  const float speed_mm_s = !start_clearance_done ?
+      APP_START_CLEARANCE_SPEED_MM_S :
+      ((remaining_mm <= APP_START_REVERSE_SLOW_REMAINING_MM) ?
+       APP_START_REVERSE_SLOW_SPEED_MM_S : APP_START_REVERSE_SPEED_MM_S);
+
+  /* Keep one field-fixed spin line from the first cycle through the 600 mm
+   * mechanism gate.  Crossing the gate only changes the target yaw and
+   * mechanism commands; it must not stop, re-anchor, or reset path motion. */
   const float heading_deg = (float)pose.heading_mdeg * 0.001f;
   float heading_error = task_wrap_angle(start_target_heading_deg - heading_deg);
   if (heading_error <= -179.9f) {
     heading_error = 180.0f;
   }
   float yaw_mm_s = heading_error * APP_START_TURN_KP_MM_S_PER_DEG;
-  if (yaw_mm_s > APP_START_TURN_MAX_MM_S) {
+  if (!start_clearance_done) {
+    yaw_mm_s = 0.0f;
+  } else if (yaw_mm_s > APP_START_TURN_MAX_MM_S) {
     yaw_mm_s = APP_START_TURN_MAX_MM_S;
   } else if (yaw_mm_s < -APP_START_TURN_MAX_MM_S) {
     yaw_mm_s = -APP_START_TURN_MAX_MM_S;
@@ -1940,6 +2001,107 @@ static bool delivery_enter_command_ok(const VisionMissionCommand *command,
          task_side_flag_valid(command->flags);
 }
 
+static uint32_t task_secondary_path_delta_mm(const LocationPose *pose)
+{
+  return (pose->path_mm >= secondary_push_start_path_mm) ?
+      (pose->path_mm - secondary_push_start_path_mm) : 0U;
+}
+
+static uint32_t task_secondary_motion_elapsed(uint32_t now_ms)
+{
+  const uint32_t delta_ms = now_ms - secondary_push_last_update_ms;
+  secondary_push_last_update_ms = now_ms;
+  if (UINT32_MAX - secondary_push_elapsed_ms < delta_ms) {
+    secondary_push_elapsed_ms = UINT32_MAX;
+  } else {
+    secondary_push_elapsed_ms += delta_ms;
+  }
+  return secondary_push_elapsed_ms;
+}
+
+static void task_set_secondary_lift(uint32_t forward_mm)
+{
+  if (forward_mm > APP_DELIVERY_SECONDARY_FORWARD_DISTANCE_MM) {
+    forward_mm = APP_DELIVERY_SECONDARY_FORWARD_DISTANCE_MM;
+  }
+  const float progress = (float)forward_mm /
+      (float)APP_DELIVERY_SECONDARY_FORWARD_DISTANCE_MM;
+  const float angle = (float)APP_LIFT_TRAVEL_ANGLE -
+      (float)(APP_LIFT_TRAVEL_ANGLE - APP_LIFT_START_ANGLE) * progress;
+  Lift_SetAngle((uint8_t)(angle + 0.5f));
+}
+
+static void task_process_secondary_back(
+    const VisionMissionCommand *command, uint32_t now_ms)
+{
+  if (!delivery_enter_command_ok(command, now_ms)) {
+    Motor_Stop();
+    task_status.motors_active = false;
+    secondary_push_last_update_ms = now_ms;
+    return;
+  }
+
+  LocationPose pose;
+  if (!task_get_location_pose(&pose, now_ms)) {
+    secondary_push_last_update_ms = now_ms;
+    return;
+  }
+  Lift_SetTravelPosition();
+  const uint32_t travelled_mm = task_secondary_path_delta_mm(&pose);
+  const uint32_t elapsed_ms = task_secondary_motion_elapsed(now_ms);
+  if (travelled_mm >= APP_DELIVERY_SECONDARY_BACK_DISTANCE_MM) {
+    task_enter(TASK_RAM_FORWARD, now_ms);
+    return;
+  }
+  if (elapsed_ms >= APP_DELIVERY_SECONDARY_BACK_TIMEOUT_MS) {
+    task_stop(TASK_FAULT_RAM, now_ms);
+    return;
+  }
+  if (!Motor_MoveSpin(APP_DELIVERY_SECONDARY_BACK_SPEED_MM_S,
+                      180.0f, 0.0f)) {
+    task_stop(TASK_FAULT_MOTOR, now_ms);
+    return;
+  }
+  task_status.motors_active = true;
+}
+
+static void task_process_secondary_forward(
+    const VisionMissionCommand *command, uint32_t now_ms)
+{
+  if (!delivery_enter_command_ok(command, now_ms)) {
+    Motor_Stop();
+    task_status.motors_active = false;
+    secondary_push_last_update_ms = now_ms;
+    return;
+  }
+
+  LocationPose pose;
+  if (!task_get_location_pose(&pose, now_ms)) {
+    secondary_push_last_update_ms = now_ms;
+    return;
+  }
+  const uint32_t forward_mm = task_secondary_path_delta_mm(&pose);
+  const uint32_t elapsed_ms = task_secondary_motion_elapsed(now_ms);
+  task_set_secondary_lift(forward_mm);
+  if (forward_mm >= APP_DELIVERY_SECONDARY_FORWARD_DISTANCE_MM) {
+    Motor_Stop();
+    task_status.motors_active = false;
+    secondary_push_lift_restore_pending = true;
+    task_enter(TASK_RAM_VERIFY, now_ms);
+    return;
+  }
+  if (elapsed_ms >= APP_DELIVERY_SECONDARY_FORWARD_TIMEOUT_MS) {
+    task_stop(TASK_FAULT_RAM, now_ms);
+    return;
+  }
+  if (!Motor_MoveSpin(APP_DELIVERY_SECONDARY_FORWARD_SPEED_MM_S,
+                      0.0f, 0.0f)) {
+    task_stop(TASK_FAULT_MOTOR, now_ms);
+    return;
+  }
+  task_status.motors_active = true;
+}
+
 static void task_process_delivery_verify(
     const VisionMissionCommand *command, uint32_t now_ms)
 {
@@ -1983,6 +2145,13 @@ static void task_process_face_center(const VisionData *vision,
       command, VISION_CMD_RETURN_CENTER,
       APP_RETURN_CENTER_SPEED_MM_S, now_ms);
   if (result == REMOTE_ROUTE_REACHED) {
+    if (secondary_push_lift_restore_pending) {
+      /* Restore the travel angle only after the real RETURN_CENTER route has
+       * completed; never lower the board while the chassis is still at the
+       * safe-zone wall. */
+      Lift_SetTravelPosition();
+      secondary_push_lift_restore_pending = false;
+    }
     task_enter(TASK_SEARCH, now_ms);
   } else if (result == REMOTE_ROUTE_COMMAND_INVALID) {
     Motor_Stop();
@@ -2368,6 +2537,7 @@ static void task_accept_mission(const VisionMissionCommand *command,
              (state <= TASK_GRAB_ROTATE) &&
              (!complete_flow_active || (audit_received && audit_valid))) {
     task_status.acknowledged_sequence = command->sequence;
+    secondary_push_eligible = task_secondary_push_allowed();
     if (cargo_recheck_pending) {
       /* Backoff has physically separated the released cargo.  Close both
        * claws to the ordinary touch angles again so the retained cargo cannot
@@ -2416,6 +2586,8 @@ static void task_accept_mission(const VisionMissionCommand *command,
     }
   } else if ((command->command == VISION_CMD_ENTER_SAFE_ZONE) &&
              ((state == TASK_OPEN_FOR_RAM) ||
+              (state == TASK_RAM_BACK) ||
+              (state == TASK_RAM_FORWARD) ||
               (state == TASK_RAM_VERIFY))) {
     task_status.acknowledged_sequence = command->sequence;
   } else if ((command->command == VISION_CMD_TASK_COMPLETE) &&
@@ -2524,6 +2696,10 @@ void Task_Process(uint32_t now_ms)
           APP_APPROACH_LOSS_HOLD_MS) {
         task_enter(TASK_SEARCH, now_ms);
       }
+    } else if ((state == TASK_RAM_BACK) ||
+               (state == TASK_RAM_FORWARD)) {
+      /* A HOLD pauses the physical phase and its no-progress watchdog. */
+      secondary_push_last_update_ms = now_ms;
     }
     task_publish_status(now_ms);
     return;
@@ -2610,8 +2786,17 @@ void Task_Process(uint32_t now_ms)
         }
       } else if ((uint32_t)(now_ms - step_started_ms) >=
                  APP_DELIVERY_CAMERA_SETTLE_MS) {
-        task_enter(TASK_RAM_VERIFY, now_ms);
+        task_enter(secondary_push_eligible ? TASK_RAM_BACK : TASK_RAM_VERIFY,
+                   now_ms);
       }
+      break;
+
+    case TASK_RAM_BACK:
+      task_process_secondary_back(&vision.mission, now_ms);
+      break;
+
+    case TASK_RAM_FORWARD:
+      task_process_secondary_forward(&vision.mission, now_ms);
       break;
 
     case TASK_RAM_VERIFY:

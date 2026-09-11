@@ -107,6 +107,11 @@ void Lift_SetTravelPosition(void)
   Servo_SetAngle(1U, APP_LIFT_TRAVEL_ANGLE);
 }
 
+void Lift_SetAngle(uint8_t angle)
+{
+  Servo_SetAngle(1U, angle);
+}
+
 bool Claw_Open(uint32_t now_ms)
 {
   return claw_move_together(CLAW_ACTION_OPEN, now_ms, 108U, 72U, 1000U);
